@@ -1,12 +1,11 @@
 mod graph_cycles;
 
 use petgraph::graph::{DiGraph, NodeIndex};
-use petgraph::dot::Dot;
 use graph_cycles::Cycles;
 use reqwest;
-use reqwest::header::USER_AGENT;
 use serde::Deserialize;
 use std::collections::HashMap;
+use tungstenite::{connect, Message};
 
 #[derive(Debug, Deserialize)]
 struct CoinbasePair {
@@ -17,9 +16,10 @@ struct CoinbasePair {
 }
 
 #[derive(Debug, Deserialize)]
-struct CoinbaseTicker {
-    ask: String,
-    bid: String,
+struct TickerEntry {
+    product_id: String,
+    best_bid: String,
+    best_ask: String,
 }
 
 fn fetch_trading_pairs() -> Vec<CoinbasePair> {
@@ -30,22 +30,44 @@ fn fetch_trading_pairs() -> Vec<CoinbasePair> {
 }
 
 fn fetch_exchange_rates(pairs: &[CoinbasePair], graph: &mut DiGraph::<String, f64>) {
-    let client = reqwest::blocking::Client::new();
+    println!("finding cycles");
 
-    let filtered_pairs: Vec<&CoinbasePair> = pairs.into_iter().filter(|x| node_with_weight(&graph, &x.base_currency) && node_with_weight(&graph, &x.quote_currency)).collect();
+    let cycles = &graph.cycles();
+
+    println!("Starting websocket client to stay up to date...");
 
     // only get rates for trading pairs that are in the graph
-    for pair in filtered_pairs {
-        let url = format!("https://api.exchange.coinbase.com/products/{}/ticker", pair.id);
-        let response = client.get(&url).header(USER_AGENT, "My Rust Program 1.0").send().unwrap();
-		let ticker = response.json::<CoinbaseTicker>().unwrap();
-		let ask = ticker.ask.parse::<f64>().unwrap();
-        let bid = ticker.bid.parse::<f64>().unwrap();
-        let base = find_node_with_weight(&graph, &pair.base_currency).unwrap();
-        let quote = find_node_with_weight(&graph, &pair.quote_currency).unwrap();
-        graph.update_edge(base, quote, 1.0/bid);
-        graph.update_edge(quote, base, ask);
-		println!("{} ask {} bid {}", pair.id, ticker.ask, ticker.bid);
+    let filtered_pairs: Vec<&CoinbasePair> = pairs.into_iter().filter(|x| node_with_weight(&graph, &x.base_currency) && node_with_weight(&graph, &x.quote_currency)).collect();
+    let filtered_ids = filtered_pairs.into_iter().map(|x| format!("\"{}\"", x.id).into()).collect::<Vec<String>>().join(", ");
+    println!("Pairs we're watching: {filtered_ids}");
+
+    let (mut socket, _) = connect("wss://ws-feed.exchange.coinbase.com").expect("Can't connect");
+    println!("Connected to the websocket feed");
+
+    socket.send(Message::Text(format!("{{ \"type\": \"subscribe\", \"product_ids\": [{filtered_ids}], \"channels\": [\"ticker\"] }}").into())).expect("Error sending message");
+    println!("Sent subscribe message");
+
+    loop {
+        let msg = socket.read().expect("Error reading message");
+
+        if let Message::Text(text_msg) = msg {
+            if let Ok(entry) = serde_json::from_str::<TickerEntry>(&text_msg) {
+                let (base_str, quote_str) = entry.product_id.split_once("-").unwrap();
+                let ask = entry.best_ask.parse::<f64>().unwrap();
+                let bid = entry.best_bid.parse::<f64>().unwrap();
+                let base = find_node_with_weight(&graph, &base_str.to_string()).unwrap();
+                let quote = find_node_with_weight(&graph, &quote_str.to_string()).unwrap();
+                graph.update_edge(base, quote, 1.0/bid);
+                graph.update_edge(quote, base, ask);
+
+                let gain_cycles: Vec<GainCycle> = cycles.into_iter().map(|x| GainCycle { gain: calculate_gain(&x, &graph), cycle: x.clone()}).collect();
+                let best_deal = gain_cycles.iter().max_by(|a, b| a.gain.partial_cmp(&b.gain).unwrap()).unwrap();
+                println!("net gain {}x for path {}", best_deal.gain, print_cycle(&best_deal.cycle, &graph));
+            }
+            else {
+                println!("Non ticker entry: {text_msg}");
+            }
+        }
     }
 }
 
@@ -77,12 +99,22 @@ fn main() {
     let mut node_map = HashMap::new();
     // Add nodes to graph
     for trading_pair in &trading_pairs {
+        // skip view-only currency pairs for now (until I can figure out how to get access to trade them)
+        if trading_pair.base_currency == "EUR" || trading_pair.quote_currency == "EUR" || trading_pair.base_currency == "GBP" || trading_pair.quote_currency == "GBP" {
+            continue
+        }
+
         node_map.entry(trading_pair.base_currency.clone()).or_insert_with(|| graph.add_node(trading_pair.base_currency.clone()));
         node_map.entry(trading_pair.quote_currency.clone()).or_insert_with(|| graph.add_node(trading_pair.quote_currency.clone()));
     }
 
     // Add edges
     for trading_pair in &trading_pairs {
+        // skip view-only currency pairs for now (until I can figure out how to get access to trade them)
+        if trading_pair.base_currency == "EUR" || trading_pair.quote_currency == "EUR" || trading_pair.base_currency == "GBP" || trading_pair.quote_currency == "GBP" {
+            continue
+        }
+
         let base = node_map[&trading_pair.base_currency];
         let quote = node_map[&trading_pair.quote_currency];
         graph.add_edge(base, quote, 0.0);
@@ -107,23 +139,6 @@ fn main() {
 
     // update edges with actual rates now
     fetch_exchange_rates(&trading_pairs, &mut graph);
-
-	//println!("{}", Dot::new(&graph));
-
-	println!("finding cycles");
-
-	// print each cycle in turn
-    let cycles = graph.cycles();
-
-    println!("found {} cycles", cycles.len());
-
-    let mut gain_cycles: Vec<GainCycle> = cycles.into_iter().map(|x| GainCycle { gain: calculate_gain(&x, &graph), cycle: x.clone()}).collect();
-    gain_cycles.sort_by(|a, b| a.gain.partial_cmp(&b.gain).unwrap());
-    for gain_cycle in gain_cycles {
-        if gain_cycle.gain > 1.0 {
-            println!("net gain {}x for path {}", gain_cycle.gain, print_cycle(&gain_cycle.cycle, &graph));
-        }
-    }
 }
 
 struct GainCycle {
@@ -137,7 +152,7 @@ fn calculate_gain(cycle: &Vec<NodeIndex>, graph: &DiGraph::<String, f64>) -> f64
     for window in cycle.windows(2) {
         let edge = graph.edges_connecting(window[0], window[1]).next().unwrap();
 
-        gain *= edge.weight() * 0.996 // factor in taker fee
+        gain *= edge.weight() * (1.0 - 0.012) // factor in taker fee of 1.2%
     }
     
     gain
