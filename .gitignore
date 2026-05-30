@@ -1,2 +1,7 @@
 /target
 .DS_Store
+.claude/
+
+# Coinbase API credentials — never commit these.
+/coinbase_api_key.json
+*.pem

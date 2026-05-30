@@ -1,166 +1,150 @@
-use std::ops::ControlFlow;
+use std::collections::HashSet;
 
-use ahash::AHashSet;
 use petgraph::{
-    algo::tarjan_scc,
+    graph::{Graph, NodeIndex},
     stable_graph::IndexType,
-    visit::{GraphBase, IntoNeighbors, IntoNodeIdentifiers, NodeIndexable},
-    EdgeType, Graph,
+    EdgeType,
 };
 
-/// Trait for identifying cycles in a graph
+/// Minimum and maximum number of distinct vertices in a reported cycle.
+const MIN_LEN: usize = 3;
+const MAX_LEN: usize = 5;
+
+/// Trait for enumerating cycles in a graph.
 pub trait Cycles {
-    //! The node identifier of the underlying graph
+    /// The node identifier of the underlying graph.
     type NodeId;
 
-    /// Apply the `visitor` to each cycle until we are told to stop
+    /// Find every cycle whose length (number of distinct vertices) is between
+    /// [`MIN_LEN`] and [`MAX_LEN`] inclusive.
     ///
-    /// The first argument passed to the visitor is a reference to the
-    /// graph and the second one a slice with all nodes that form the
-    /// cycle. If at any point the visitor returns
-    /// `ControlFlow::Break(b)` this function stops visiting any
-    /// further cycles and returns `Some(b)`. Otherwise the return
-    /// value is `None`.
-    fn visit_cycles<F, B>(&self, visitor: F) -> Option<B> where F: FnMut(&Self, &[Self::NodeId]) -> ControlFlow<B>;
-
-    /// Apply the `visitor` to each cycle until we are told to stop
-    ///
-    /// The first argument passed to the visitor is a reference to the
-    /// graph and the second one a slice with all nodes that form the
-    /// cycle.
-    fn visit_all_cycles<F>(&self, mut visitor: F) where F: FnMut(&Self, &[Self::NodeId]),
-    {
-        self.visit_cycles(|g, n| {
-            visitor(g, n);
-            ControlFlow::<(), ()>::Continue(())
-        });
-    }
-
-    /// Find all cycles
-    ///
-    /// Each element of the returned `Vec` is a `Vec` of all nodes in one cycle.
+    /// Each returned element is the cycle's vertices in traversal order with the
+    /// start vertex appended again to close the loop, e.g. `[a, b, c, a]`. Both
+    /// traversal directions of an undirected cycle are reported (they are
+    /// distinct trades), but rotations of the same directed cycle are reported
+    /// only once.
     fn cycles(&self) -> Vec<Vec<Self::NodeId>>;
 }
 
 impl<N, E, Ty: EdgeType, Ix: IndexType> Cycles for Graph<N, E, Ty, Ix> {
-    type NodeId = <Graph<N, E, Ty, Ix> as GraphBase>::NodeId;
-
-    fn visit_cycles<F, B>(&self, mut visitor: F) -> Option<B> where F: FnMut(&Graph<N, E, Ty, Ix>, &[Self::NodeId]) -> ControlFlow<B>,
-    {
-        for component in tarjan_scc(self) {
-            let mut finder = CycleFinder::new(self, component);
-            if let ControlFlow::Break(b) = finder.visit(&mut visitor) {
-                return Some(b);
-            }
-        }
-        None
-    }
+    type NodeId = NodeIndex<Ix>;
 
     fn cycles(&self) -> Vec<Vec<Self::NodeId>> {
-        let mut cycles = Vec::new();
-        self.visit_all_cycles(|_, cycle| {
-            let mut cycle_vec = cycle.to_vec();
-            cycle_vec.push(cycle_vec[0]);
-            cycles.push(cycle_vec)
-        });
-        cycles
+        let mut result = Vec::new();
+        // Dedup is defensive: the min-start construction below already yields
+        // each directed cycle once, but a canonical key guards against repeats
+        // from parallel edges.
+        let mut seen: HashSet<Vec<NodeIndex<Ix>>> = HashSet::new();
+        let mut path: Vec<NodeIndex<Ix>> = Vec::with_capacity(MAX_LEN);
+
+        for start in self.node_indices() {
+            path.clear();
+            path.push(start);
+            dfs(self, start, start, &mut path, &mut result, &mut seen);
+        }
+
+        result
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct CycleFinder<G, N> {
-    graph: G,
-    scc: Vec<N>,
-    blocked: Vec<bool>,
-    b: Vec<AHashSet<usize>>,
-    stack: Vec<N>,
-    s: usize,
+/// Depth-limited DFS that enumerates simple cycles returning to `start`.
+///
+/// Determinism and dedup come from a single rule: every intermediate vertex
+/// must have a strictly greater index than `start`. That forces `start` to be
+/// the minimum vertex of any cycle we record, so each directed cycle is found
+/// exactly once (in its canonical, min-rooted rotation) and the traversal order
+/// is fully determined by the graph's structure — no hashing-order dependence.
+fn dfs<N, E, Ty: EdgeType, Ix: IndexType>(
+    graph: &Graph<N, E, Ty, Ix>,
+    start: NodeIndex<Ix>,
+    current: NodeIndex<Ix>,
+    path: &mut Vec<NodeIndex<Ix>>,
+    result: &mut Vec<Vec<NodeIndex<Ix>>>,
+    seen: &mut HashSet<Vec<NodeIndex<Ix>>>,
+) {
+    for next in graph.neighbors(current) {
+        if next == start {
+            // Closing the loop back to the start vertex.
+            if path.len() >= MIN_LEN && seen.insert(path.clone()) {
+                let mut closed = path.clone();
+                closed.push(start);
+                result.push(closed);
+            }
+        } else if next > start && path.len() < MAX_LEN && !path.contains(&next) {
+            path.push(next);
+            dfs(graph, start, next, path, result, seen);
+            path.pop();
+        }
+    }
 }
 
-impl<G> CycleFinder<G, G::NodeId> where G: IntoNodeIdentifiers + IntoNeighbors + NodeIndexable,
-{
-    fn new(graph: G, scc: Vec<G::NodeId>) -> Self {
-        let num_vertices = scc.len();
-        Self {
-            graph,
-            scc,
-            blocked: vec![false; num_vertices],
-            b: vec![Default::default(); num_vertices],
-            stack: Default::default(),
-            s: Default::default(),
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use petgraph::graph::UnGraph;
+
+    fn ring(n: u32) -> UnGraph<(), ()> {
+        let edges: Vec<(u32, u32)> = (0..n).map(|i| (i, (i + 1) % n)).collect();
+        UnGraph::from_edges(&edges)
     }
 
-    fn visit<F, B>(&mut self, visitor: &mut F) -> ControlFlow<B>
-        where F: FnMut(G, &[G::NodeId]) -> ControlFlow<B>,
-    {
-        // cycle finding algorithm from
-        for s in 0..self.scc.len() {
-            self.s = s;
-            self.blocked[s..].fill(false);
-            for b in &mut self.b[s + 1..] {
-                b.clear();
-            }
-            if let ControlFlow::Break(b) = self.circuit(s, visitor) {
-                return ControlFlow::Break(b);
-            }
-            self.blocked[s] = true;
-        }
-        ControlFlow::Continue(())
+    #[test]
+    fn triangle_has_both_directions() {
+        // A single triangle is one undirected cycle = two directed cycles.
+        assert_eq!(ring(3).cycles().len(), 2);
     }
 
-    fn circuit<B, F>(&mut self, v: usize, visitor: &mut F) -> ControlFlow<B, bool>
-        where F: FnMut(G, &[G::NodeId]) -> ControlFlow<B>,
-    {
-        let mut f = false;
-
-        self.stack.push(self.scc[v]);
-        self.blocked[v] = true;
-
-        // L1:
-        for w in self.adjacent_vertices(v) {
-            if w == self.s {
-                // ✅ Only process cycles of length 3
-                if self.stack.len() >= 3 && self.stack.len() <= 5 {
-                    if let ControlFlow::Break(b) = visitor(self.graph, &self.stack) {
-                        return ControlFlow::Break(b);
-                    }
-                    f = true;
-                }
-            } else if !self.blocked[w] && matches!(self.circuit(w, visitor), ControlFlow::Continue(true))
-            {
-                f = true;
-            }
-        }
-
-        // L2:
-        if f {
-            self.unblock(v)
-        } else {
-            for w in self.adjacent_vertices(v) {
-                self.b[w].insert(v);
-            }
-        }
-
-        self.stack.pop(); // v
-        ControlFlow::Continue(f)
+    #[test]
+    fn square_and_pentagon_within_bounds() {
+        assert_eq!(ring(4).cycles().len(), 2); // length 4
+        assert_eq!(ring(5).cycles().len(), 2); // length 5 == MAX_LEN
     }
 
-    fn unblock(&mut self, v: usize) {
-        self.blocked[v] = false;
-        let tmp = self.b[v].clone();
-        for w in tmp {
-            if self.blocked[w] {
-                self.unblock(w)
-            }
-        }
-        self.b[v].clear()
+    #[test]
+    fn cycles_over_max_len_are_excluded() {
+        // A 6-ring's only cycle has 6 vertices (> MAX_LEN), so nothing is found.
+        assert_eq!(ring(6).cycles().len(), 0);
     }
 
-    fn adjacent_vertices(&self, v: usize) -> Vec<usize> {
-        self.graph
-            .neighbors(self.scc[v])
-            .filter_map(|n| self.scc.iter().position(|v| *v == n))
-            .collect()
+    #[test]
+    fn complete_graph_k4_counts() {
+        // K4: C(4,3)=4 triangles and 3 four-cycles, each in both directions
+        // => 4*2 + 3*2 = 14.
+        let k4 = UnGraph::<(), ()>::from_edges(&[
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (1, 2),
+            (1, 3),
+            (2, 3),
+        ]);
+        assert_eq!(k4.cycles().len(), 14);
+    }
+
+    #[test]
+    fn output_is_deterministic() {
+        // The whole point of the rewrite: identical results across runs,
+        // including ordering (no hashing-order dependence).
+        let k4 = UnGraph::<(), ()>::from_edges(&[
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (1, 2),
+            (1, 3),
+            (2, 3),
+        ]);
+        assert_eq!(k4.cycles(), k4.cycles());
+    }
+
+    #[test]
+    fn cycles_are_closed_and_canonical() {
+        for cycle in ring(4).cycles() {
+            // Closed: first == last.
+            assert_eq!(cycle.first(), cycle.last());
+            // Canonical: the start (== the repeated endpoint) is the minimum
+            // vertex of the cycle.
+            let min = cycle.iter().min().unwrap();
+            assert_eq!(cycle.first().unwrap(), min);
+        }
     }
 }
